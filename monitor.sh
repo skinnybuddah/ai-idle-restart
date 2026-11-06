@@ -1,5 +1,6 @@
 #!/bin/sh
 
+
 # 1. Parsing Inputs, Variables, and Defaults
 TIMEOUT_MINUTES=${IDLE_TIMEOUT:-15}
 IDLE_TIMEOUT_SECS=$((TIMEOUT_MINUTES * 60))
