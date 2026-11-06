@@ -21,7 +21,8 @@ TARGET_SERVICE=""
 # Step 1: Check if the user forced an explicit service override via environment variable
 if [ -n "$AI_SERVICE_NAME" ]; then
     echo "[!] Override Detected: Using user-defined service name from AI_SERVICE_NAME."
-    if docker compose ps --services | grep -qxF "$AI_SERVICE_NAME"; then
+    # Use standard grep containing word boundaries to completely ignore hidden spacing or return symbols
+    if docker compose ps --services | grep -q -E "(^| )$AI_SERVICE_NAME($| )"; then
         TARGET_SERVICE="$AI_SERVICE_NAME"
         echo "[✓] Verified: Service '$TARGET_SERVICE' successfully found in Docker Compose configuration."
     else
@@ -29,6 +30,20 @@ if [ -n "$AI_SERVICE_NAME" ]; then
         TARGET_SERVICE="$AI_SERVICE_NAME"
     fi
 fi
+
+
+# Removed this step1 version as it was too harsh on the matching algo
+# Step 1: Check if the user forced an explicit service override via environment variable
+#if [ -n "$AI_SERVICE_NAME" ]; then
+#    echo "[!] Override Detected: Using user-defined service name from AI_SERVICE_NAME."
+#    if docker compose ps --services | grep -qxF "$AI_SERVICE_NAME"; then
+#        TARGET_SERVICE="$AI_SERVICE_NAME"
+#        echo "[✓] Verified: Service '$TARGET_SERVICE' successfully found in Docker Compose configuration."
+#    else
+#        echo "[X] WARNING: Forced service '$AI_SERVICE_NAME' was not found in 'docker compose ps --services'."
+#        TARGET_SERVICE="$AI_SERVICE_NAME"
+#    fi
+#fi
 
 # Step 2: Fallback to keyword auto-detection
 if [ -z "$TARGET_SERVICE" ]; then
