@@ -1,6 +1,5 @@
 #!/bin/sh
 
-
 # 1. Parsing Inputs, Variables, and Defaults
 TIMEOUT_MINUTES=${IDLE_TIMEOUT:-15}
 IDLE_TIMEOUT_SECS=$((TIMEOUT_MINUTES * 60))
@@ -19,34 +18,23 @@ echo "=================================================="
 
 TARGET_SERVICE=""
 
-# --------------------------------------------------------
-# AUTOMAGIC DETECTION ENGINE
-# --------------------------------------------------------
-
 # Step 1: Check if the user forced an explicit service override via environment variable
 if [ -n "$AI_SERVICE_NAME" ]; then
     echo "[!] Override Detected: Using user-defined service name from AI_SERVICE_NAME."
-    # Verify if the service actually exists in the current compose project
     if docker compose ps --services | grep -qxF "$AI_SERVICE_NAME"; then
         TARGET_SERVICE="$AI_SERVICE_NAME"
         echo "[✓] Verified: Service '$TARGET_SERVICE' successfully found in Docker Compose configuration."
     else
         echo "[X] WARNING: Forced service '$AI_SERVICE_NAME' was not found in 'docker compose ps --services'."
-        echo "    Attempting to proceed with it anyway..."
         TARGET_SERVICE="$AI_SERVICE_NAME"
     fi
 fi
 
-# Step 2: Fallback to keyword auto-detection if no explicit override was specified
+# Step 2: Fallback to keyword auto-detection
 if [ -z "$TARGET_SERVICE" ]; then
     echo "[*] Scanning Docker Compose stack for known AI engines..."
-    
-    # Priority list of engine keywords (covers llama.cpp, ollama, vllm, localai, tgi, etc.)
     AI_KEYWORDS="llama-cpp|llama.cpp|ollama|localai|vllm|tgi|tabby|litellm|stable-diffusion|koboldcpp"
-    
-    # Get all services in the stack, filter by key phrases, take the topmost match
     DETECTED=$(docker compose ps --services | grep -E -i "$AI_KEYWORDS" | head -n 1)
-    
     if [ -n "$DETECTED" ]; then
         TARGET_SERVICE="$DETECTED"
         echo "[✓] Auto-detected AI Engine service: '$TARGET_SERVICE'"
@@ -56,23 +44,18 @@ fi
 # Step 3: Hardware-independent fallback (GPU / Acceleration passthrough scanning)
 if [ -z "$TARGET_SERVICE" ]; then
     echo "[*] Keyword scanning yielded no results. Scanning configurations for GPU hardware mappings..."
-    
-    # Inspect all container definitions in JSON format to identify GPU devices or runtime layers
-    # This captures: 'nvidia', 'renderD128', 'dri', 'kfd' (Intel/AMD/ATI GPU device structures)
     DETECTED_GPU_SVC=$(docker compose ps --format json 2>/dev/null | \
                       grep -E -i "nvidia|devices|gpu|dri/render|kfd|dri" | \
                       awk -F'"Service": "' '{print $2}' | awk -F'"' '{print $1}' | head -n 1)
-    
     if [ -n "$DETECTED_GPU_SVC" ]; then
         TARGET_SERVICE="$DETECTED_GPU_SVC"
         echo "[✓] Auto-detected accelerated engine via device passthroughs: '$TARGET_SERVICE'"
     fi
 fi
 
-# Step 4: Final hard fallback if everything else fails completely
+# Step 4: Final hard fallback
 if [ -z "$TARGET_SERVICE" ]; then
     echo "[!] Initialization Warning: Autodetection failed completely."
-    echo "    Defaulting blind fallback to target service name: 'llama-cpp'"
     TARGET_SERVICE="llama-cpp"
 fi
 
@@ -86,26 +69,31 @@ echo "=================================================="
 echo "[*] Watchdog fully active and monitoring log signatures..."
 
 # --------------------------------------------------------
-# CORE LIFE CYCLE MONITORING LOOP
+# CORE LIFE CYCLE MONITORING LOOP (COUNTER STRATEGY)
 # --------------------------------------------------------
-while true; do
-    # Capture standard request and generation signatures across all common AI backends
-    LAST_LOG_TIME=$(docker compose logs --tail 200 "$TARGET_SERVICE" 2>&1 | \
-                    grep -E -i "POST|GET|HTTP|slot|HTTP/1.1|\[GIN\]|v1/|generation|tokenize|predict" | tail -n 1 | \
-                    awk '{print $1,$2}' || true)
+# Store the initial log footprint signature
+LAST_LOG_HASH=$(docker compose logs --tail 5 "$TARGET_SERVICE" 2>&1 | md5sum)
+CURRENT_IDLE_SECS=0
+CHECK_INTERVAL=30
 
-    if [ -z "$LAST_LOG_TIME" ]; then
-        # Fall back to container start time to prevent cold-boot restart storms
-        LAST_LOG_EPOCH=$(docker compose inspect "$TARGET_SERVICE" --format '{{pid .State.StartedAt}}' 2>/dev/null || date +%s)
+while true; do
+    sleep "$CHECK_INTERVAL"
+    
+    # Grab the current tail signature of the logs
+    CURRENT_LOG_HASH=$(docker compose logs --tail 5 "$TARGET_SERVICE" 2>&1 | md5sum)
+    
+    if [ "$CURRENT_LOG_HASH" = "$LAST_LOG_HASH" ]; then
+        # No new logs mean the container is completely quiet
+        CURRENT_IDLE_SECS=$((CURRENT_IDLE_SECS + CHECK_INTERVAL))
     else
-        LAST_LOG_EPOCH=$(date -d "$LAST_LOG_TIME" +%s 2>/dev/null || date +%s)
+        # New log activity detected! Reset the idle timer completely
+        CURRENT_IDLE_SECS=0
+        LAST_LOG_HASH="$CURRENT_LOG_HASH"
     fi
 
-    CURRENT_EPOCH=$(date +%s)
-    IDLE_TIME=$((CURRENT_EPOCH - LAST_LOG_EPOCH))
-
-    if [ "$IDLE_TIME" -ge "$IDLE_TIMEOUT_SECS" ]; then
-        echo "$(date): Active engine service '$TARGET_SERVICE' has reached the idle threshold ($((IDLE_TIME / 60)) minutes). Executing $CHOSEN_ACTION..."
+    # Trigger action if idle duration matches or exceeds our timeout threshold
+    if [ "$CURRENT_IDLE_SECS" -ge "$IDLE_TIMEOUT_SECS" ]; then
+        echo "$(date): Service '$TARGET_SERVICE' has been entirely idle for ${TIMEOUT_MINUTES} minutes. Executing $CHOSEN_ACTION..."
 
         case "$CHOSEN_ACTION" in
             "Restart")
@@ -121,9 +109,9 @@ while true; do
                 ;;
         esac
 
-        # Cool-down to let the backend safely initialize, pass health checks, and parse storage paths
+        # Clear tracking metrics and sleep to let the stack fully warm back up
+        CURRENT_IDLE_SECS=0
         sleep 180
+        LAST_LOG_HASH=$(docker compose logs --tail 5 "$TARGET_SERVICE" 2>&1 | md5sum)
     fi
-
-    sleep 30
 done
