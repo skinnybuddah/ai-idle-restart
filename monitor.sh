@@ -16,12 +16,30 @@ echo "=================================================="
 echo "    🤖 AI IDLE WATCHDOG INITIALIZATION 🤖        "
 echo "=================================================="
 
+# --------------------------------------------------------
+# AUTOMAGIC COMPOSE PROJECT NAMESPACE DETECTION
+# --------------------------------------------------------
+# If COMPOSE_PROJECT_NAME isn't explicitly set, discover it from the host mount metadata
+if [ -z "$COMPOSE_PROJECT_NAME" ]; then
+    # Get the container's own short ID
+    MY_HOSTNAME=$(hostname)
+    
+    # Query the Docker socket to inspect our own volume mounts and extract the source folder name on the host
+    HOST_FOLDER_PATH=$(docker inspect -f '{{ range .Mounts }}{{ if eq .Destination "/stack" }}{{ .Source }}{{ end }}{{ end }}' "$MY_HOSTNAME" 2>/dev/null)
+    
+    if [ -n "$HOST_FOLDER_PATH" ]; then
+        # Strip the full path down to just the trailing directory name (e.g., /home/bob/dockers/ollama -> ollama)
+        DETECTED_PROJECT=$(basename "$HOST_FOLDER_PATH" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9_-]//g')
+        export COMPOSE_PROJECT_NAME="$DETECTED_PROJECT"
+        echo "[✓] Auto-aligned project namespace to host folder: '$COMPOSE_PROJECT_NAME'"
+    fi
+fi
+
 TARGET_SERVICE=""
 
-# Step 1: Check if the user forced an explicit service override via environment variable
+# Step 2: Check if the user forced an explicit service override via environment variable
 if [ -n "$AI_SERVICE_NAME" ]; then
     echo "[!] Override Detected: Using user-defined service name from AI_SERVICE_NAME."
-    # Use standard grep containing word boundaries to completely ignore hidden spacing or return symbols
     if docker compose ps --services | grep -q -E "(^| )$AI_SERVICE_NAME($| )"; then
         TARGET_SERVICE="$AI_SERVICE_NAME"
         echo "[✓] Verified: Service '$TARGET_SERVICE' successfully found in Docker Compose configuration."
@@ -31,21 +49,7 @@ if [ -n "$AI_SERVICE_NAME" ]; then
     fi
 fi
 
-
-# Removed this step1 version as it was too harsh on the matching algo
-# Step 1: Check if the user forced an explicit service override via environment variable
-#if [ -n "$AI_SERVICE_NAME" ]; then
-#    echo "[!] Override Detected: Using user-defined service name from AI_SERVICE_NAME."
-#    if docker compose ps --services | grep -qxF "$AI_SERVICE_NAME"; then
-#        TARGET_SERVICE="$AI_SERVICE_NAME"
-#        echo "[✓] Verified: Service '$TARGET_SERVICE' successfully found in Docker Compose configuration."
-#    else
-#        echo "[X] WARNING: Forced service '$AI_SERVICE_NAME' was not found in 'docker compose ps --services'."
-#        TARGET_SERVICE="$AI_SERVICE_NAME"
-#    fi
-#fi
-
-# Step 2: Fallback to keyword auto-detection
+# Step 3: Fallback to keyword auto-detection
 if [ -z "$TARGET_SERVICE" ]; then
     echo "[*] Scanning Docker Compose stack for known AI engines..."
     AI_KEYWORDS="llama-cpp|llama.cpp|ollama|localai|vllm|tgi|tabby|litellm|stable-diffusion|koboldcpp"
@@ -56,7 +60,7 @@ if [ -z "$TARGET_SERVICE" ]; then
     fi
 fi
 
-# Step 3: Hardware-independent fallback (GPU / Acceleration passthrough scanning)
+# Step 4: Hardware-independent fallback (GPU / Acceleration passthrough scanning)
 if [ -z "$TARGET_SERVICE" ]; then
     echo "[*] Keyword scanning yielded no results. Scanning configurations for GPU hardware mappings..."
     DETECTED_GPU_SVC=$(docker compose ps --format json 2>/dev/null | \
@@ -68,7 +72,7 @@ if [ -z "$TARGET_SERVICE" ]; then
     fi
 fi
 
-# Step 4: Final hard fallback
+# Step 5: Final hard fallback
 if [ -z "$TARGET_SERVICE" ]; then
     echo "[!] Initialization Warning: Autodetection failed completely."
     TARGET_SERVICE="llama-cpp"
@@ -86,27 +90,21 @@ echo "[*] Watchdog fully active and monitoring log signatures..."
 # --------------------------------------------------------
 # CORE LIFE CYCLE MONITORING LOOP (COUNTER STRATEGY)
 # --------------------------------------------------------
-# Store the initial log footprint signature
 LAST_LOG_HASH=$(docker compose logs --tail 5 "$TARGET_SERVICE" 2>&1 | md5sum)
 CURRENT_IDLE_SECS=0
 CHECK_INTERVAL=30
 
 while true; do
     sleep "$CHECK_INTERVAL"
-    
-    # Grab the current tail signature of the logs
     CURRENT_LOG_HASH=$(docker compose logs --tail 5 "$TARGET_SERVICE" 2>&1 | md5sum)
     
     if [ "$CURRENT_LOG_HASH" = "$LAST_LOG_HASH" ]; then
-        # No new logs mean the container is completely quiet
         CURRENT_IDLE_SECS=$((CURRENT_IDLE_SECS + CHECK_INTERVAL))
     else
-        # New log activity detected! Reset the idle timer completely
         CURRENT_IDLE_SECS=0
         LAST_LOG_HASH="$CURRENT_LOG_HASH"
     fi
 
-    # Trigger action if idle duration matches or exceeds our timeout threshold
     if [ "$CURRENT_IDLE_SECS" -ge "$IDLE_TIMEOUT_SECS" ]; then
         echo "$(date): Service '$TARGET_SERVICE' has been entirely idle for ${TIMEOUT_MINUTES} minutes. Executing $CHOSEN_ACTION..."
 
@@ -124,7 +122,6 @@ while true; do
                 ;;
         esac
 
-        # Clear tracking metrics and sleep to let the stack fully warm back up
         CURRENT_IDLE_SECS=0
         sleep 180
         LAST_LOG_HASH=$(docker compose logs --tail 5 "$TARGET_SERVICE" 2>&1 | md5sum)
