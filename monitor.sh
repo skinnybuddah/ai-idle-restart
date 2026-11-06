@@ -49,16 +49,28 @@ if [ -n "$AI_SERVICE_NAME" ]; then
     fi
 fi
 
-# Step 3: Fallback to keyword auto-detection
+# Step 3: Fallback to keyword auto-detection (Optimised Priority Layer)
 if [ -z "$TARGET_SERVICE" ]; then
     echo "[*] Scanning Docker Compose stack for known AI engines..."
-    AI_KEYWORDS="llama-cpp|llama.cpp|ollama|localai|vllm|tgi|tabby|litellm|stable-diffusion|koboldcpp"
-    DETECTED=$(docker compose ps --services | grep -E -i "$AI_KEYWORDS" | head -n 1)
-    if [ -n "$DETECTED" ]; then
-        TARGET_SERVICE="$DETECTED"
-        echo "[✓] Auto-detected AI Engine service: '$TARGET_SERVICE'"
+    
+    # Tier 1 Priority: Heavyweight Compute Backends
+    ENGINE_KEYWORDS="llama-cpp|llama.cpp|ollama|vllm|localai|tgi|koboldcpp|stable-diffusion"
+    DETECTED_ENG=$(docker compose ps --services | grep -E -i "$ENGINE_KEYWORDS" | grep -v -E -- "-db|_db|-postgres|-redis" | head -n 1)
+    
+    if [ -n "$DETECTED_ENG" ]; then
+        TARGET_SERVICE="$DETECTED_ENG"
+        echo "[✓] Auto-detected primary AI Engine service: '$TARGET_SERVICE'"
+    else
+        # Tier 2 Priority: Secondary Aggregators / Proxies
+        PROXY_KEYWORDS="litellm|tabby|memory-proxy"
+        DETECTED_PRX=$(docker compose ps --services | grep -E -i "$PROXY_KEYWORDS" | grep -v -E -- "-db|_db|-postgres|-redis" | head -n 1)
+        if [ -n "$DETECTED_PRX" ]; then
+            TARGET_SERVICE="$DETECTED_PRX"
+            echo "[✓] Auto-detected secondary AI Proxy service: '$TARGET_SERVICE'"
+        fi
     fi
 fi
+
 
 # Step 4: Hardware-independent fallback (GPU / Acceleration passthrough scanning)
 if [ -z "$TARGET_SERVICE" ]; then
