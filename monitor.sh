@@ -1,114 +1,100 @@
 #!/bin/sh
 
-# 1. Parsing Inputs, Variables, and Defaults
+# 1. Parse environmental configurations and defaults
 TIMEOUT_MINUTES=${IDLE_TIMEOUT:-15}
 IDLE_TIMEOUT_SECS=$((TIMEOUT_MINUTES * 60))
 CHOSEN_ACTION=${ACTION:-UPDOWN}
-
-case "${AI_CONTAINER_MODE:-D}" in
-    "D") MODE_FLAG="-d" ;;
-    "F") MODE_FLAG="" ;;
-    "A") MODE_FLAG="--abort-on-container-exit" ;;
-    *)   MODE_FLAG="-d" ;; 
-esac
+USER_SERVICE_NAME=${AI_SERVICE_NAME:-"llama-cpp"}
 
 echo "=================================================="
 echo "    🤖 AI IDLE WATCHDOG INITIALIZATION 🤖        "
 echo "=================================================="
+echo "[*] Scanning active containers via Docker Socket..."
 
-# --------------------------------------------------------
-# AUTOMAGIC COMPOSE PROJECT NAMESPACE DETECTION
-# --------------------------------------------------------
-# If COMPOSE_PROJECT_NAME isn't explicitly set, discover it from the host mount metadata
-if [ -z "$COMPOSE_PROJECT_NAME" ]; then
-    # Get the container's own short ID
-    MY_HOSTNAME=$(hostname)
-    
-    # Query the Docker socket to inspect our own volume mounts and extract the source folder name on the host
-    HOST_FOLDER_PATH=$(docker inspect -f '{{ range .Mounts }}{{ if eq .Destination "/stack" }}{{ .Source }}{{ end }}{{ end }}' "$MY_HOSTNAME" 2>/dev/null)
-    
-    if [ -n "$HOST_FOLDER_PATH" ]; then
-        # Strip the full path down to just the trailing directory name (e.g., /home/bob/dockers/ollama -> ollama)
-        DETECTED_PROJECT=$(basename "$HOST_FOLDER_PATH" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9_-]//g')
-        export COMPOSE_PROJECT_NAME="$DETECTED_PROJECT"
-        echo "[✓] Auto-aligned project namespace to host folder: '$COMPOSE_PROJECT_NAME'"
-    fi
-fi
+# Find the target container ID by looking at the Docker Compose service label natively
+TARGET_ID=$(docker ps --filter "label=com.docker.compose.service=$USER_SERVICE_NAME" -q | head -n 1)
 
-TARGET_SERVICE=""
-
-# Step 2: Check if the user forced an explicit service override via environment variable
-if [ -n "$AI_SERVICE_NAME" ]; then
-    echo "[!] Override Detected: Using user-defined service name from AI_SERVICE_NAME."
-    if docker compose ps --services | grep -q -E "(^| )$AI_SERVICE_NAME($| )"; then
-        TARGET_SERVICE="$AI_SERVICE_NAME"
-        echo "[✓] Verified: Service '$TARGET_SERVICE' successfully found in Docker Compose configuration."
-    else
-        echo "[X] WARNING: Forced service '$AI_SERVICE_NAME' was not found in 'docker compose ps --services'."
-        TARGET_SERVICE="$AI_SERVICE_NAME"
-    fi
-fi
-
-# Step 3: Fallback to keyword auto-detection (Optimised Priority Layer)
-if [ -z "$TARGET_SERVICE" ]; then
-    echo "[*] Scanning Docker Compose stack for known AI engines..."
+# Fallback: Scan labels for any common AI keywords if the explicit service name isn't matched
+if [ -z "$TARGET_ID" ]; then
+    echo "[*] Service '$USER_SERVICE_NAME' not found. Scanning container labels for AI keywords..."
+    AI_KEYWORDS="llama-cpp|llama.cpp|ollama|vllm|localai|tgi|koboldcpp|stable-diffusion"
     
-    # Tier 1 Priority: Heavyweight Compute Backends
-    ENGINE_KEYWORDS="llama-cpp|llama.cpp|ollama|vllm|localai|tgi|koboldcpp|stable-diffusion"
-    DETECTED_ENG=$(docker compose ps --services | grep -E -i "$ENGINE_KEYWORDS" | grep -v -E -- "-db|_db|-postgres|-redis" | head -n 1)
-    
-    if [ -n "$DETECTED_ENG" ]; then
-        TARGET_SERVICE="$DETECTED_ENG"
-        echo "[✓] Auto-detected primary AI Engine service: '$TARGET_SERVICE'"
-    else
-        # Tier 2 Priority: Secondary Aggregators / Proxies
-        PROXY_KEYWORDS="litellm|tabby|memory-proxy"
-        DETECTED_PRX=$(docker compose ps --services | grep -E -i "$PROXY_KEYWORDS" | grep -v -E -- "-db|_db|-postgres|-redis" | head -n 1)
-        if [ -n "$DETECTED_PRX" ]; then
-            TARGET_SERVICE="$DETECTED_PRX"
-            echo "[✓] Auto-detected secondary AI Proxy service: '$TARGET_SERVICE'"
+    for id in $(docker ps -q); do
+        svc_label=$(docker inspect -f '{{ index .Config.Labels "com.docker.compose.service" }}' "$id" 2>/dev/null)
+        if echo "$svc_label" | grep -E -i -q "$AI_KEYWORDS"; then
+            # Filter out database containers completely
+            if ! echo "$svc_label" | grep -E -i -q "-db|_db|-postgres|-redis"; then
+                TARGET_ID="$id"
+                USER_SERVICE_NAME="$svc_label"
+                echo "[✓] Auto-detected AI service via label parsing: '$USER_SERVICE_NAME'"
+                break
+            fi
         fi
-    fi
+    done
 fi
 
-
-# Step 4: Hardware-independent fallback (GPU / Acceleration passthrough scanning)
-if [ -z "$TARGET_SERVICE" ]; then
-    echo "[*] Keyword scanning yielded no results. Scanning configurations for GPU hardware mappings..."
-    DETECTED_GPU_SVC=$(docker compose ps --format json 2>/dev/null | \
-                      grep -E -i "nvidia|devices|gpu|dri/render|kfd|dri" | \
-                      awk -F'"Service": "' '{print $2}' | awk -F'"' '{print $1}' | head -n 1)
-    if [ -n "$DETECTED_GPU_SVC" ]; then
-        TARGET_SERVICE="$DETECTED_GPU_SVC"
-        echo "[✓] Auto-detected accelerated engine via device passthroughs: '$TARGET_SERVICE'"
-    fi
+# Fallback 2: Scan for active hardware acceleration mappings (NVIDIA/AMD/Intel)
+if [ -z "$TARGET_ID" ]; then
+    echo "[*] Keyword scanning empty. Checking container hardware device paths..."
+    for id in $(docker ps -q); do
+        devices=$(docker inspect -f '{{ .HostConfig.Devices }}' "$id" 2>/dev/null)
+        runtime=$(docker inspect -f '{{ .ProcessLabel }} {{ .Runtime }}' "$id" 2>/dev/null)
+        if echo "$devices $runtime" | grep -E -i -q "nvidia|gpu|dri|render|kfd"; then
+            svc_label=$(docker inspect -f '{{ index .Config.Labels "com.docker.compose.service" }}' "$id" 2>/dev/null)
+            if [ -n "$svc_label" ] && ! echo "$svc_label" | grep -E -i -q "-db|_db|-postgres|-redis"; then
+                TARGET_ID="$id"
+                USER_SERVICE_NAME="$svc_label"
+                echo "[✓] Auto-detected hardware accelerated service: '$USER_SERVICE_NAME'"
+                break
+            fi
+        fi
+    done
 fi
 
-# Step 5: Final hard fallback
-if [ -z "$TARGET_SERVICE" ]; then
-    echo "[!] Initialization Warning: Autodetection failed completely."
-    TARGET_SERVICE="llama-cpp"
+# Final Fallback Configuration
+if [ -z "$TARGET_ID" ]; then
+    echo "[!] WARNING: Could not resolve a running container for target '$USER_SERVICE_NAME'."
+    echo "    The watchdog will continuously scan until the service mounts or comes online."
 fi
 
 echo "--------------------------------------------------"
 echo "📢 WATCHDOG CONFIGURATION PROFILE SUMMARY:"
-echo "👉 TARGET ENGINE SERVICE : $TARGET_SERVICE"
+echo "👉 TARGET COMPOSE SERVICE: $USER_SERVICE_NAME"
+echo "👉 TARGET CONTAINER ID   : ${TARGET_ID:-Waiting to boot...}"
 echo "👉 IDLE RUNTIME TIMEOUT  : ${TIMEOUT_MINUTES} minutes"
 echo "👉 INTERVENTION ACTION   : $CHOSEN_ACTION"
-echo "👉 SYSTEM EXECUTION MODE : $AI_CONTAINER_MODE (Compose flag: ${MODE_FLAG:-(None)})"
 echo "=================================================="
-echo "[*] Watchdog fully active and monitoring log signatures..."
+echo "[*] Watchdog fully active and auditing container logs..."
 
 # --------------------------------------------------------
-# CORE LIFE CYCLE MONITORING LOOP (COUNTER STRATEGY)
+# CORE RUNTIME LOOP (SOCKET LOG-HASH COUNTER STRATEGY)
 # --------------------------------------------------------
-LAST_LOG_HASH=$(docker compose logs --tail 5 "$TARGET_SERVICE" 2>&1 | md5sum)
 CURRENT_IDLE_SECS=0
 CHECK_INTERVAL=30
+LAST_LOG_HASH=""
 
 while true; do
+    # If the container isn't active or dropped during a cycle, keep scanning until it exists
+    if [ -z "$TARGET_ID" ] || ! docker ps -q | grep -q "$TARGET_ID"; then
+        TARGET_ID=$(docker ps --filter "label=com.docker.compose.service=$USER_SERVICE_NAME" -q | head -n 1)
+        if [ -n "$TARGET_ID" ]; then
+            echo "[✓] Connection established with Container ID: $TARGET_ID"
+            LAST_LOG_HASH=$(docker logs --tail 5 "$TARGET_ID" 2>&1 | md5sum)
+            CURRENT_IDLE_SECS=0
+        fi
+        sleep 10
+        continue
+    fi
+
+    # Initialize log tracking signature on cold boot
+    if [ -z "$LAST_LOG_HASH" ]; then
+        LAST_LOG_HASH=$(docker logs --tail 5 "$TARGET_ID" 2>&1 | md5sum)
+    fi
+
     sleep "$CHECK_INTERVAL"
-    CURRENT_LOG_HASH=$(docker compose logs --tail 5 "$TARGET_SERVICE" 2>&1 | md5sum)
+    
+    # Query logs directly via the raw engine socket using the container ID
+    CURRENT_LOG_HASH=$(docker logs --tail 5 "$TARGET_ID" 2>&1 | md5sum)
     
     if [ "$CURRENT_LOG_HASH" = "$LAST_LOG_HASH" ]; then
         CURRENT_IDLE_SECS=$((CURRENT_IDLE_SECS + CHECK_INTERVAL))
@@ -117,22 +103,18 @@ while true; do
         LAST_LOG_HASH="$CURRENT_LOG_HASH"
     fi
 
+    # Trigger memory clearing intervention on timeout threshold match
     if [ "$CURRENT_IDLE_SECS" -ge "$IDLE_TIMEOUT_SECS" ]; then
-        echo "$(date): Service '$TARGET_SERVICE' has been entirely idle for ${TIMEOUT_MINUTES} minutes. Executing $CHOSEN_ACTION..."
+        echo "$(date): Target '$USER_SERVICE_NAME' ($TARGET_ID) has been entirely idle for ${TIMEOUT_MINUTES} minutes."
+        echo "[*] Executing action '$CHOSEN_ACTION' via native container controls to flush system VRAM..."
 
-        case "$CHOSEN_ACTION" in
-            "Restart")
-                docker compose restart "$TARGET_SERVICE"
-                ;;
-            "Recreate"|"UPDOWN")
-                # Both profiles now utilize the atomic recreate mechanism 
-                # to instantly clear VRAM while completely preventing volume path sync lag
-                docker compose up $MODE_FLAG --force-recreate "$TARGET_SERVICE"
-                ;;
-        esac
+        # Raw docker engine commands safely recycle the exact container process space, 
+        # completely avoiding compose interpolation errors and volume path mounting lag.
+        docker restart "$TARGET_ID"
 
+        echo "[✓] Action completed successfully. VRAM released to Host OS."
         CURRENT_IDLE_SECS=0
+        LAST_LOG_HASH=""
         sleep 180
-        LAST_LOG_HASH=$(docker compose logs --tail 5 "$TARGET_SERVICE" 2>&1 | md5sum)
     fi
 done
