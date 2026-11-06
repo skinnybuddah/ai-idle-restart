@@ -128,8 +128,13 @@ while true; do
                 docker compose up $MODE_FLAG --force-recreate "$TARGET_SERVICE"
                 ;;
             "UPDOWN")
-                docker compose stop "$TARGET_SERVICE" && \
-                docker compose rm -f "$TARGET_SERVICE" && \
+                # Natively tear down just the target service container
+                docker compose down "$TARGET_SERVICE" && \
+                
+                # Keep the 1-second pause to let the host relative volume mounts safely settle
+                sleep 1 && \
+                
+                # Re-orchestrate the service freshly back into the active stack
                 docker compose up $MODE_FLAG "$TARGET_SERVICE"
                 ;;
         esac
